@@ -10,7 +10,7 @@
 #include <sdkhooks>
 #tryinclude <sourcescramble>
 
-#define PSM_VERSION	1.5.0
+#define PSM_VERSION	1.6.0
 
 #define PSM_ENABLE_CLEANUP
 
@@ -52,7 +52,10 @@ enum struct DynamicDetourData
 	DynamicDetour detour;
 	DHookCallback callbackPre;
 	DHookCallback callbackPost;
-	
+	ShouldEnableCallback condition;
+	ConVar dependency;
+	bool active;
+
 	void Toggle(bool enable)
 	{
 		if (this.callbackPre != INVALID_FUNCTION)
@@ -98,6 +101,7 @@ enum struct EnforcedConVarData
 	char value[64];
 	char initialValue[64];
 	ShouldEnableCallback condition;
+	ConVar dependency;
 	bool active;
 }
 
@@ -107,6 +111,7 @@ enum struct SyncedConVarData
 	char initialValue[64];
 	ConVar sourceConVar;
 	ShouldEnableCallback condition;
+	ConVar dependency;
 	bool active;
 }
 
@@ -230,6 +235,7 @@ enum struct MemoryPatchData
 
 static bool s_isInitialized;
 static bool s_isEnabled;
+static bool s_pendingDetourRefresh;
 static char s_conVarName[64];
 static ConVar s_stateConVar;
 static GameData s_gamedata;
@@ -357,11 +363,7 @@ stock void PSM_SetPluginState(bool enable)
 	// Detours
 	for (int i = 0; i < s_dynamicDetours.Length; i++)
 	{
-		DynamicDetourData data;
-		if (s_dynamicDetours.GetArray(i, data))
-		{
-			data.Toggle(enable);
-		}
+		ToggleDynamicDetour(i, enable);
 	}
 	
 	if (!enable)
@@ -620,18 +622,21 @@ stock void PSM_RemoveEventHook(const char[] name, EventHook callback, EventHookM
  * @param name				Name of the function in a "Functions" section to load.
  * @param callbackPre		Optional pre callback function.
  * @param callbackPost		Optional post callback function.
+ * @param condition			Optional callback deciding whether the detour should be enabled at all.
+ * 							While it returns false, the detour stays uninstalled and its callbacks never run.
+ * @param dependency		Optional convar the condition depends on. Its changes re-evaluate the condition.
  * @return					The registered DynamicDetour.
  * 							If an identical detour was already registered, the existing one is returned.
  * @error					Invalid gamedata, plugin state manager not initialized or GameData handle not initialized.
  */
-stock DynamicDetour PSM_AddDynamicDetourFromConf(const char[] name, DHookCallback callbackPre = INVALID_FUNCTION, DHookCallback callbackPost = INVALID_FUNCTION)
+stock DynamicDetour PSM_AddDynamicDetourFromConf(const char[] name, DHookCallback callbackPre = INVALID_FUNCTION, DHookCallback callbackPost = INVALID_FUNCTION, ShouldEnableCallback condition = INVALID_FUNCTION, ConVar dependency = null)
 {
 	ThrowIfNotInitialized(true);
-	
+
 	DynamicDetour detour = DynamicDetour.FromConf(s_gamedata, name);
 	if (detour)
 	{
-		DynamicDetour registered = PSM_AddDynamicDetour(name, detour, callbackPre, callbackPost);
+		DynamicDetour registered = PSM_AddDynamicDetour(name, detour, callbackPre, callbackPost, condition, dependency);
 		if (registered != detour)
 			delete detour;
 
@@ -651,11 +656,14 @@ stock DynamicDetour PSM_AddDynamicDetourFromConf(const char[] name, DHookCallbac
  * @param detour			The DynamicDetour object.
  * @param callbackPre		Optional pre callback function.
  * @param callbackPost		Optional post callback function.
+ * @param condition			Optional callback deciding whether the detour should be enabled at all.
+ * 							While it returns false, the detour stays uninstalled and its callbacks never run.
+ * @param dependency		Optional convar the condition depends on. Its changes re-evaluate the condition.
  * @return					The registered DynamicDetour.
  * 							If an identical detour was already registered, the existing one is returned.
  * @error					Plugin state manager or GameData handle not initialized.
  */
-stock DynamicDetour PSM_AddDynamicDetour(const char[] name, DynamicDetour detour, DHookCallback callbackPre = INVALID_FUNCTION, DHookCallback callbackPost = INVALID_FUNCTION)
+stock DynamicDetour PSM_AddDynamicDetour(const char[] name, DynamicDetour detour, DHookCallback callbackPre = INVALID_FUNCTION, DHookCallback callbackPost = INVALID_FUNCTION, ShouldEnableCallback condition = INVALID_FUNCTION, ConVar dependency = null)
 {
 	ThrowIfNotInitialized();
 
@@ -666,16 +674,24 @@ stock DynamicDetour PSM_AddDynamicDetour(const char[] name, DynamicDetour detour
 			return existing.detour;
 	}
 
+	// Only hook a dependency once, even if multiple registrations share it
+	bool hookDependency = dependency && !IsDependencyConVarInUse(dependency);
+
 	DynamicDetourData data;
 	strcopy(data.name, sizeof(data.name), name);
 	data.detour = detour;
 	data.callbackPre = callbackPre;
 	data.callbackPost = callbackPost;
+	data.condition = condition;
+	data.dependency = dependency;
 
-	s_dynamicDetours.PushArray(data);
+	int index = s_dynamicDetours.PushArray(data);
+
+	if (hookDependency)
+		dependency.AddChangeHook(OnDependencyConVarChanged);
 
 	if (PSM_IsEnabled())
-		data.Toggle(true);
+		ToggleDynamicDetour(index, true);
 
 	return detour;
 }
@@ -963,10 +979,10 @@ stock void PSM_SDKUnhook(int entity)
  * @param value			The value to enforce.
  * @param condition		Optional callback deciding whether the value should be enforced at all.
  * 						While it returns false, the convar keeps whatever value it had.
- * 						Call 'PSM_RefreshConVars' after anything the callback depends on changes.
+ * @param dependency	Optional convar the condition depends on. Its changes re-evaluate the condition.
  * @error				Invalid convar name or plugin state manager not initialized.
  */
-stock void PSM_AddEnforcedConVar(const char[] name, const char[] value, ShouldEnableCallback condition = INVALID_FUNCTION)
+stock void PSM_AddEnforcedConVar(const char[] name, const char[] value, ShouldEnableCallback condition = INVALID_FUNCTION, ConVar dependency = null)
 {
 	ThrowIfNotInitialized();
 
@@ -974,12 +990,19 @@ stock void PSM_AddEnforcedConVar(const char[] name, const char[] value, ShouldEn
 	if (!convar)
 		ThrowError("Failed to find convar '%s'", name);
 
+	// Only hook a dependency once, even if multiple convars share it
+	bool hookDependency = dependency && !IsDependencyConVarInUse(dependency);
+
 	EnforcedConVarData data;
 	strcopy(data.name, sizeof(data.name), name);
 	strcopy(data.value, sizeof(data.value), value);
 	data.condition = condition;
+	data.dependency = dependency;
 
 	int index = s_enforcedConVars.PushArray(data);
+
+	if (hookDependency)
+		dependency.AddChangeHook(OnDependencyConVarChanged);
 
 	if (PSM_IsEnabled())
 		ToggleEnforcedConVar(index, true);
@@ -992,10 +1015,10 @@ stock void PSM_AddEnforcedConVar(const char[] name, const char[] value, ShouldEn
  * @param sourceName		The name of the source convar.
  * @param condition			Optional callback deciding whether the convars should be kept in sync at all.
  * 							While it returns false, the target convar keeps whatever value it had.
- * 							Call 'PSM_RefreshConVars' after anything the callback depends on changes.
+ * @param dependency		Optional convar the condition depends on. Its changes re-evaluate the condition.
  * @error					Invalid convar name or plugin state manager not initialized.
  */
-stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName, ShouldEnableCallback condition = INVALID_FUNCTION)
+stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName, ShouldEnableCallback condition = INVALID_FUNCTION, ConVar dependency = null)
 {
 	ThrowIfNotInitialized();
 
@@ -1007,26 +1030,35 @@ stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName,
 	if (!source)
 		ThrowError("Failed to find convar '%s'", sourceName);
 
+	// Only hook a dependency once, even if multiple convars share it
+	bool hookDependency = dependency && !IsDependencyConVarInUse(dependency);
+
 	SyncedConVarData data;
 	strcopy(data.name, sizeof(data.name), targetName);
 	data.sourceConVar = source;
 	data.condition = condition;
+	data.dependency = dependency;
 
 	int index = s_syncedConVars.PushArray(data);
+
+	if (hookDependency)
+		dependency.AddChangeHook(OnDependencyConVarChanged);
 
 	if (PSM_IsEnabled())
 		ToggleSyncedConVar(index, true);
 }
 
 /**
- * Re-evaluates the conditions of every registered enforced and synced convar.
+ * Re-evaluates the condition of every registration that has one.
  *
- * Convars whose condition started returning true are applied, convars whose condition stopped returning true
- * are given their original value back.
+ * Only needed for conditions depending on something other than a convar,
+ * since anything that declared a 'dependency' is already refreshed on its own.
+ *
+ * Convars are updated immediately, detours on the next frame.
  *
  * @error				Plugin state manager not initialized.
  */
-stock void PSM_RefreshConVars()
+stock void PSM_RefreshConditions()
 {
 	ThrowIfNotInitialized();
 
@@ -1040,6 +1072,12 @@ stock void PSM_RefreshConVars()
 	for (int i = 0; i < s_syncedConVars.Length; i++)
 	{
 		ToggleSyncedConVar(i, enable);
+	}
+
+	if (!s_pendingDetourRefresh)
+	{
+		s_pendingDetourRefresh = true;
+		RequestFrame(Frame_RefreshDetours);
 	}
 }
 
@@ -1315,7 +1353,7 @@ static bool PSM_ShouldEnable()
 	return true;
 }
 
-static bool ShouldApplyConVar(ShouldEnableCallback condition)
+static bool ShouldApplyCondition(ShouldEnableCallback condition)
 {
 	if (condition == INVALID_FUNCTION)
 		return true;
@@ -1344,7 +1382,7 @@ static void ToggleEnforcedConVar(int index, bool enable)
 	if (!convar)
 		return;
 
-	if (enable && !ShouldApplyConVar(data.condition))
+	if (enable && !ShouldApplyCondition(data.condition))
 		enable = false;
 
 	// The initial value is only captured while we are applying it, so never restore one we do not have
@@ -1370,6 +1408,47 @@ static void ToggleEnforcedConVar(int index, bool enable)
 	}
 }
 
+static bool IsDependencyConVarInUse(ConVar dependency)
+{
+	for (int i = 0; i < s_enforcedConVars.Length; i++)
+	{
+		if (s_enforcedConVars.Get(i, EnforcedConVarData::dependency) == dependency)
+			return true;
+	}
+
+	for (int i = 0; i < s_syncedConVars.Length; i++)
+	{
+		if (s_syncedConVars.Get(i, SyncedConVarData::dependency) == dependency)
+			return true;
+	}
+
+	for (int i = 0; i < s_dynamicDetours.Length; i++)
+	{
+		if (s_dynamicDetours.Get(i, DynamicDetourData::dependency) == dependency)
+			return true;
+	}
+
+	return false;
+}
+
+static void ToggleDynamicDetour(int index, bool enable)
+{
+	DynamicDetourData data;
+	if (!s_dynamicDetours.GetArray(index, data))
+		return;
+
+	if (enable && !ShouldApplyCondition(data.condition))
+		enable = false;
+
+	if (enable == data.active)
+		return;
+
+	data.active = enable;
+	s_dynamicDetours.SetArray(index, data);
+
+	data.Toggle(enable);
+}
+
 static bool IsSourceConVarInUse(ConVar source, int exceptIndex)
 {
 	for (int i = 0; i < s_syncedConVars.Length; i++)
@@ -1391,7 +1470,7 @@ static void ToggleSyncedConVar(int index, bool enable)
 	if (!s_syncedConVars.GetArray(index, data))
 		return;
 
-	if (enable && !ShouldApplyConVar(data.condition))
+	if (enable && !ShouldApplyCondition(data.condition))
 		enable = false;
 
 	if (enable == data.active)
@@ -1433,6 +1512,24 @@ static void ToggleSyncedConVar(int index, bool enable)
 			target.RemoveChangeHook(OnSyncedConVarChanged);
 			target.SetString(data.initialValue);
 		}
+	}
+}
+
+static void OnDependencyConVarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	PSM_RefreshConditions();
+}
+
+static void Frame_RefreshDetours(any data)
+{
+	s_pendingDetourRefresh = false;
+
+	bool enable = PSM_IsEnabled();
+
+	// Detours without a condition are already in their target state, so this is a no-op for them
+	for (int i = 0; i < s_dynamicDetours.Length; i++)
+	{
+		ToggleDynamicDetour(i, enable);
 	}
 }
 
