@@ -10,7 +10,7 @@
 #include <sdkhooks>
 #tryinclude <sourcescramble>
 
-#define PSM_VERSION	1.4.1
+#define PSM_VERSION	1.5.0
 
 #define PSM_ENABLE_CLEANUP
 
@@ -97,6 +97,8 @@ enum struct EnforcedConVarData
 	char name[64];
 	char value[64];
 	char initialValue[64];
+	ShouldEnableCallback condition;
+	bool active;
 }
 
 enum struct SyncedConVarData
@@ -104,6 +106,7 @@ enum struct SyncedConVarData
 	char name[64];
 	char initialValue[64];
 	ConVar sourceConVar;
+	ShouldEnableCallback condition;
 	bool active;
 }
 
@@ -956,11 +959,14 @@ stock void PSM_SDKUnhook(int entity)
 /**
  * Registers an "enforced" convar, meaning that its value will be enforced even if it is changed by configs or other plugins.
  *
- * @param name		The name of the convar.
- * @param value		The value to enforce.
- * @error			Invalid convar name or plugin state manager not initialized.
+ * @param name			The name of the convar.
+ * @param value			The value to enforce.
+ * @param condition		Optional callback deciding whether the value should be enforced at all.
+ * 						While it returns false, the convar keeps whatever value it had.
+ * 						Call 'PSM_RefreshConVars' after anything the callback depends on changes.
+ * @error				Invalid convar name or plugin state manager not initialized.
  */
-stock void PSM_AddEnforcedConVar(const char[] name, const char[] value)
+stock void PSM_AddEnforcedConVar(const char[] name, const char[] value, ShouldEnableCallback condition = INVALID_FUNCTION)
 {
 	ThrowIfNotInitialized();
 
@@ -971,6 +977,7 @@ stock void PSM_AddEnforcedConVar(const char[] name, const char[] value)
 	EnforcedConVarData data;
 	strcopy(data.name, sizeof(data.name), name);
 	strcopy(data.value, sizeof(data.value), value);
+	data.condition = condition;
 
 	int index = s_enforcedConVars.PushArray(data);
 
@@ -982,10 +989,13 @@ stock void PSM_AddEnforcedConVar(const char[] name, const char[] value)
  * Registers a "synced" convar, meaning that its value will always be kept in sync with another convar.
  *
  * @param targetName		The name of the convar to keep in sync.
- * @param relatedName		The name of the source convar.
+ * @param sourceName		The name of the source convar.
+ * @param condition			Optional callback deciding whether the convars should be kept in sync at all.
+ * 							While it returns false, the target convar keeps whatever value it had.
+ * 							Call 'PSM_RefreshConVars' after anything the callback depends on changes.
  * @error					Invalid convar name or plugin state manager not initialized.
  */
-stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName)
+stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName, ShouldEnableCallback condition = INVALID_FUNCTION)
 {
 	ThrowIfNotInitialized();
 
@@ -1000,11 +1010,37 @@ stock void PSM_AddSyncedConVar(const char[] targetName, const char[] sourceName)
 	SyncedConVarData data;
 	strcopy(data.name, sizeof(data.name), targetName);
 	data.sourceConVar = source;
+	data.condition = condition;
 
 	int index = s_syncedConVars.PushArray(data);
 
 	if (PSM_IsEnabled())
 		ToggleSyncedConVar(index, true);
+}
+
+/**
+ * Re-evaluates the conditions of every registered enforced and synced convar.
+ *
+ * Convars whose condition started returning true are applied, convars whose condition stopped returning true
+ * are given their original value back.
+ *
+ * @error				Plugin state manager not initialized.
+ */
+stock void PSM_RefreshConVars()
+{
+	ThrowIfNotInitialized();
+
+	bool enable = PSM_IsEnabled();
+
+	for (int i = 0; i < s_enforcedConVars.Length; i++)
+	{
+		ToggleEnforcedConVar(i, enable);
+	}
+
+	for (int i = 0; i < s_syncedConVars.Length; i++)
+	{
+		ToggleSyncedConVar(i, enable);
+	}
 }
 
 /**
@@ -1279,6 +1315,20 @@ static bool PSM_ShouldEnable()
 	return true;
 }
 
+static bool ShouldApplyConVar(ShouldEnableCallback condition)
+{
+	if (condition == INVALID_FUNCTION)
+		return true;
+
+	Call_StartFunction(null, condition);
+
+	bool value = true;
+	if (Call_Finish(value) != SP_ERROR_NONE)
+		return false;
+
+	return value;
+}
+
 static int EntIndexToEntRefSafe(int entity)
 {
 	return (entity >= 0 && IsValidEntity(entity)) ? EntIndexToEntRef(entity) : entity;
@@ -1294,6 +1344,15 @@ static void ToggleEnforcedConVar(int index, bool enable)
 	if (!convar)
 		return;
 
+	if (enable && !ShouldApplyConVar(data.condition))
+		enable = false;
+
+	// The initial value is only captured while we are applying it, so never restore one we do not have
+	if (enable == data.active)
+		return;
+
+	data.active = enable;
+
 	if (enable)
 	{
 		convar.GetString(data.initialValue, sizeof(data.initialValue));
@@ -1304,6 +1363,8 @@ static void ToggleEnforcedConVar(int index, bool enable)
 	}
 	else
 	{
+		s_enforcedConVars.SetArray(index, data);
+
 		convar.RemoveChangeHook(OnEnforcedConVarChanged);
 		convar.SetString(data.initialValue);
 	}
@@ -1330,6 +1391,12 @@ static void ToggleSyncedConVar(int index, bool enable)
 	if (!s_syncedConVars.GetArray(index, data))
 		return;
 
+	if (enable && !ShouldApplyConVar(data.condition))
+		enable = false;
+
+	if (enable == data.active)
+		return;
+
 	if (enable)
 	{
 		ConVar target = FindConVar(data.name);
@@ -1353,9 +1420,6 @@ static void ToggleSyncedConVar(int index, bool enable)
 	}
 	else
 	{
-		if (!data.active)
-			return;
-
 		data.active = false;
 		s_syncedConVars.SetArray(index, data);
 
