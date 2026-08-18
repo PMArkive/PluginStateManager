@@ -1285,7 +1285,7 @@ stock void PSM_KillTimer(Handle timer)
 	if (index != -1)
 		s_timers.Erase(index);
 	
-	delete timer;
+	KillTimer(timer);
 }
 
 /**
