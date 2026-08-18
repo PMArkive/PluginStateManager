@@ -10,7 +10,7 @@
 #include <sdkhooks>
 #tryinclude <sourcescramble>
 
-#define PSM_VERSION	1.6.0
+#define PSM_VERSION	1.7.0
 
 #define PSM_ENABLE_CLEANUP
 
@@ -144,6 +144,20 @@ enum struct EntityOutputHookData
 	}
 }
 
+enum struct SingleEntityOutputHookData
+{
+	int ref;
+	char output[64];
+	EntityOutput callback;
+}
+
+enum struct TimerData
+{
+	Handle timer;
+	Timer callback;
+	bool repeat;
+}
+
 enum struct UserMessageHookData
 {
 	UserMsg msg_id;
@@ -251,6 +265,8 @@ static ArrayList s_enforcedConVars; // ArrayList<EnforcedConVarData>
 static ArrayList s_syncedConVars;   // ArrayList<SyncedConVarData>
 static ArrayList s_conVarChangeHooks; // ArrayList<ConVarChangeHookData>
 static ArrayList s_entityOutputHooks; // ArrayList<EntityOutputHookData>
+static ArrayList s_singleEntityOutputHooks; // ArrayList<SingleEntityOutputHookData>
+static ArrayList s_timers; // ArrayList<TimerData>
 static ArrayList s_userMessageHooks; // ArrayList<UserMessageHookData>
 static ArrayList s_commandListeners; // ArrayList<CommandListenerData>
 static ArrayList s_multiTargetFilters; // ArrayList<MultiTargetFilterData>
@@ -295,6 +311,8 @@ stock void PSM_Init(const char[] conVarName, GameData gamedata = null)
 	s_syncedConVars = new ArrayList(sizeof(SyncedConVarData));
 	s_conVarChangeHooks = new ArrayList(sizeof(ConVarChangeHookData));
 	s_entityOutputHooks = new ArrayList(sizeof(EntityOutputHookData));
+	s_singleEntityOutputHooks = new ArrayList(sizeof(SingleEntityOutputHookData));
+	s_timers = new ArrayList(sizeof(TimerData));
 	s_userMessageHooks = new ArrayList(sizeof(UserMessageHookData));
 	s_commandListeners = new ArrayList(sizeof(CommandListenerData));
 	s_multiTargetFilters = new ArrayList(sizeof(MultiTargetFilterData));
@@ -384,6 +402,23 @@ stock void PSM_SetPluginState(bool enable)
 
 			s_sdkHooks.Erase(i);
 		}
+
+		// Single entity output hooks
+		for (int i = s_singleEntityOutputHooks.Length - 1; i >= 0; i--)
+		{
+			SingleEntityOutputHookData data;
+			if (s_singleEntityOutputHooks.GetArray(i, data))
+			{
+				int entity = EntRefToEntIndex(data.ref);
+				if (entity != -1)
+					UnhookSingleEntityOutput(entity, data.output, data.callback);
+			}
+	
+			s_singleEntityOutputHooks.Erase(i);
+		}
+	
+		// Timers
+		s_timers.Clear();
 	}
 	
 	// Entity output hooks
@@ -1130,6 +1165,130 @@ stock void PSM_AddEntityOutputHook(const char[] classname, const char[] output, 
 }
 
 /**
+ * Registers an entity output hook on a single entity.
+ *
+ * This should always be paired with a 'PSM_UnhookSingleEntityOutput' call in the 'OnEntityDestroyed' forward to avoid leaking resources.
+ *
+ * This function does nothing if the plugin is not currently enabled.
+ *
+ * @param entity		Entity index.
+ * @param output		The output name to hook.
+ * @param callback		An EntityOutput function pointer.
+ * @param once			If true, the hook removes itself after being called once.
+ * 						Its registration is only dropped once the entity dies or the plugin is disabled.
+ * @return				True on success, false otherwise.
+ * @error				Invalid entity or plugin state manager not initialized.
+ */
+stock bool PSM_HookSingleEntityOutput(int entity, const char[] output, EntityOutput callback, bool once = false)
+{
+	ThrowIfNotInitialized();
+	
+	if (!PSM_IsEnabled())
+		return false;
+	
+	HookSingleEntityOutput(entity, output, callback, once);
+	
+	SingleEntityOutputHookData data;
+	data.ref = EntIndexToEntRefSafe(entity);
+	strcopy(data.output, sizeof(data.output), output);
+	data.callback = callback;
+	
+	s_singleEntityOutputHooks.PushArray(data);
+	return true;
+}
+
+/**
+ * Unregisters an entity output hook on a single entity.
+ *
+ * @param entity		Entity index.
+ * @param output		The output name to unhook.
+ * @param callback		An EntityOutput function pointer.
+ * @error				Plugin state manager not initialized.
+ */
+stock void PSM_UnhookSingleEntityOutput(int entity, const char[] output, EntityOutput callback)
+{
+	ThrowIfNotInitialized();
+	
+	int ref = EntIndexToEntRefSafe(entity);
+
+	for (int i = s_singleEntityOutputHooks.Length - 1; i >= 0; i--)
+	{
+		SingleEntityOutputHookData data;
+		if (s_singleEntityOutputHooks.GetArray(i, data) && ref == data.ref && StrEqual(output, data.output) && callback == data.callback)
+		{
+			if (EntRefToEntIndex(data.ref) != -1)
+				UnhookSingleEntityOutput(entity, data.output, data.callback);
+
+			s_singleEntityOutputHooks.Erase(i);
+		}
+	}
+}
+
+/**
+ * Creates a timer that stops calling back once the plugin is disabled.
+ *
+ * Use 'PSM_KillTimer' to end it early, or return 'Plugin_Stop' from a repeating callback.
+ *
+ * This function does nothing if the plugin is not currently enabled.
+ *
+ * @param interval		Interval from the current game time to execute the given function.
+ * @param callback		A Timer function pointer.
+ * @param data			Handle or value to pass through to the callback function.
+ * @param flags			Timer flags. A 'TIMER_FLAG_NO_MAPCHANGE' timer never calls back if the map changes first.
+ * @return				Timer handle, or null if the plugin is not currently enabled.
+ * @error				Plugin state manager not initialized.
+ */
+stock Handle PSM_CreateTimer(float interval, Timer callback, any data = 0, int flags = 0)
+{
+	ThrowIfNotInitialized();
+	
+	if (!PSM_IsEnabled())
+	{
+		// The caller handed us its handle, do not leak it just because we are disabled
+		if (flags & TIMER_DATA_HNDL_CLOSE)
+		{
+			Handle handle = view_as<Handle>(data);
+			delete handle;
+		}
+	
+		return null;
+	}
+	
+	// The data is passed straight through, so SourceMod keeps honoring TIMER_DATA_HNDL_CLOSE on its own
+	Handle timer = CreateTimer(interval, Timer_PSMDispatch, data, flags);
+	if (!timer)
+		return null;
+	
+	TimerData timerData;
+	timerData.timer = timer;
+	timerData.callback = callback;
+	timerData.repeat = (flags & TIMER_REPEAT) != 0;
+	
+	s_timers.PushArray(timerData);
+	
+	return timer;
+}
+
+/**
+ * Kills a timer created by 'PSM_CreateTimer'.
+ *
+ * Closing the handle directly also ends the timer, but keeps its registration until the plugin is disabled.
+ *
+ * @param timer			The timer handle.
+ * @error				Invalid timer handle or plugin state manager not initialized.
+ */
+stock void PSM_KillTimer(Handle timer)
+{
+	ThrowIfNotInitialized();
+	
+	int index = s_timers.FindValue(timer, TimerData::timer);
+	if (index != -1)
+		s_timers.Erase(index);
+	
+	delete timer;
+}
+
+/**
  * Registers a user message hook.
  *
  * @param msg_id		Message index.
@@ -1319,6 +1478,39 @@ static void OnDynamicHookRemoved(int hookid)
 		s_dynamicHookIds.Erase(index);
 }
 
+static Action Timer_PSMDispatch(Handle timer, any data)
+{
+	int index = s_timers.FindValue(timer, TimerData::timer);
+	if (index == -1)
+		return Plugin_Stop;
+	
+	TimerData timerData;
+	if (!s_timers.GetArray(index, timerData))
+		return Plugin_Stop;
+	
+	Action action = Plugin_Continue;
+	
+	Call_StartFunction(null, timerData.callback);
+	Call_PushCell(timer);
+	Call_PushCell(data);
+	
+	// A callback that errors out would otherwise keep erroring on every repeat
+	if (Call_Finish(action) != SP_ERROR_NONE)
+		action = Plugin_Stop;
+	
+	if (!timerData.repeat || action == Plugin_Stop)
+		RemoveTimerData(timer);
+	
+	return action;
+}
+
+static void RemoveTimerData(Handle timer)
+{
+	int index = s_timers.FindValue(timer, TimerData::timer);
+	if (index != -1)
+		s_timers.Erase(index);
+}
+
 #if defined PSM_ENABLE_CLEANUP
 static void Timer_PSMCleanup(Handle timer)
 {
@@ -1332,6 +1524,14 @@ static void Timer_PSMCleanup(Handle timer)
 			{
 				s_sdkHooks.Erase(i);
 			}
+		}
+	}
+	
+	for (int i = s_singleEntityOutputHooks.Length - 1; i >= 0; i--)
+	{
+		if (EntRefToEntIndex(s_singleEntityOutputHooks.Get(i, SingleEntityOutputHookData::ref)) == -1)
+		{
+			s_singleEntityOutputHooks.Erase(i);
 		}
 	}
 }
